@@ -17,7 +17,7 @@ var version = "dev"
 const usage = `shipit: tag a new semver release from a TUI
 
 Usage:
-  shipit [flags]           pick patch/minor/major, create the tag and push it
+  shipit [flags]           pick patch/minor/major, bump version files, tag and push
   shipit init              add a "release" task to this repo's mise.toml
   shipit init --global     add a "release" task that works in every repo
   shipit version
@@ -50,6 +50,7 @@ func main() {
 	fs.StringVar(&opts.Prefix, "prefix", "", `tag prefix, e.g. "app-v" (default: match "v" or no prefix, new repos get "v")`)
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "show what would happen without creating a tag")
 	fs.BoolVar(&opts.NoPush, "no-push", false, "create the tag locally but don't push it")
+	fs.BoolVar(&opts.NoBump, "no-bump", false, "only tag; don't bump and commit version files")
 	fs.BoolVar(&opts.NoWatch, "no-watch", false, "exit after pushing instead of watching the workflows")
 	_ = fs.Parse(os.Args[1:])
 	fs.Visit(func(f *flag.Flag) {
@@ -64,7 +65,7 @@ func main() {
 		os.Exit(1)
 	}
 	m := final.(model)
-	if m.stage == stError || (m.stage == stDone && summarise(m.watchRuns) == StateFail) {
+	if m.stage == stError || m.stage == stFailed || (m.stage == stDone && summarise(m.watchRuns) == StateFail) {
 		os.Exit(1)
 	}
 }

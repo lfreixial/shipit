@@ -17,6 +17,7 @@ type Options struct {
 	DryRun    bool
 	NoPush    bool
 	NoWatch   bool
+	NoBump    bool
 }
 
 type stage int
@@ -25,10 +26,11 @@ const (
 	stLoading stage = iota
 	stSelect
 	stConfirm
-	stTagging
+	stRunning // running the plan's steps
 	stWatching
 	stDone
-	stError
+	stFailed // a step failed
+	stError  // couldn't start at all
 )
 
 const (
@@ -46,10 +48,16 @@ type loadedMsg struct {
 	tagRuns  []Run
 	headRuns []Run
 	ghNote   string
-	err      error
+
+	root    string
+	cfg     Config
+	files   []*VersionFile
+	fileErr string
+
+	err error
 }
 
-type taggedMsg struct{ err error }
+type stepMsg struct{ err error }
 
 type watchMsg struct {
 	runs    []Run
@@ -75,8 +83,16 @@ type model struct {
 	headRuns []Run
 	ghNote   string
 
+	root    string
+	cfg     Config
+	files   []*VersionFile
+	fileErr string
+
 	cursor int
-	newTag string
+	note   string // transient message on the select screen
+	plan   *Plan
+	step   int
+	undo   string // what rollback did after a failed step
 
 	watchStart time.Time
 	watchRuns  []Run
@@ -101,6 +117,17 @@ func (m model) load() tea.Cmd {
 			return loadedMsg{err: err}
 		}
 		msg := loadedMsg{repo: repo}
+		msg.root, _ = git("rev-parse", "--show-toplevel")
+		if msg.cfg, err = loadConfig(msg.root); err != nil {
+			return loadedMsg{err: err}
+		}
+		if !opts.NoBump {
+			msg.files, err = findVersionFiles(msg.root, msg.cfg, repo.Latest, repo.HasLatest)
+			if err != nil {
+				msg.fileErr = err.Error()
+			}
+		}
+
 		if !haveGH() {
 			msg.ghNote = "gh CLI not found, so workflow status is unavailable"
 			return msg
@@ -139,6 +166,42 @@ func (m model) defaultPrefix() string {
 	return "v"
 }
 
+// bumpFiles are the version files that will be rewritten.
+func (m model) bumpFiles() []*VersionFile {
+	var out []*VersionFile
+	for _, f := range m.files {
+		if f.Skip == "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func (m model) newPlan(kind string) *Plan {
+	v := m.next(kind)
+	p := &Plan{
+		Tag:     v.String(),
+		Version: plain(v),
+		Root:    m.root,
+		Remote:  m.opts.Remote,
+		Branch:  m.repo.Branch,
+		Push:    !m.opts.NoPush,
+	}
+	if !m.opts.NoBump {
+		// Files already at this version (a re-run after a failed tag
+		// push) need no commit.
+		for _, f := range m.bumpFiles() {
+			if f.Current != p.Version {
+				p.Files = append(p.Files, f)
+			}
+		}
+		p.Command = m.cfg.Command
+		p.Message = m.cfg.commitMessage(p.Version)
+	}
+	p.build()
+	return p
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case spinner.TickMsg:
@@ -153,6 +216,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.repo, m.gh, m.release = msg.repo, msg.gh, msg.release
 		m.tagRuns, m.headRuns, m.ghNote = msg.tagRuns, msg.headRuns, msg.ghNote
+		m.root, m.cfg, m.files, m.fileErr = msg.root, msg.cfg, msg.files, msg.fileErr
 		if m.stage == stLoading {
 			m.stage = stSelect
 		}
@@ -167,12 +231,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case taggedMsg:
+	case stepMsg:
 		if msg.err != nil {
-			m.stage, m.err = stError, msg.err
+			m.err = msg.err
+			m.undo = m.plan.rollback()
+			m.stage = stFailed
 			return m, tea.Quit
 		}
-		if m.opts.DryRun || m.opts.NoPush || m.opts.NoWatch || m.gh == nil {
+		m.step++
+		if m.step < len(m.plan.steps) {
+			return m, m.runStep()
+		}
+		if m.opts.NoPush || m.opts.NoWatch || m.gh == nil {
 			m.stage = stDone
 			return m, tea.Quit
 		}
@@ -212,6 +282,7 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	switch m.stage {
 	case stSelect:
+		m.note = ""
 		switch k {
 		case "q", "esc":
 			return m, tea.Quit
@@ -228,24 +299,33 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "r":
 			return m, m.load()
 		case "enter", "space", " ":
-			m.newTag = m.next(bumpKinds[m.cursor]).String()
-			if tagExists(m.newTag) {
-				m.ghNote = "tag " + m.newTag + " already exists locally"
+			p := m.newPlan(bumpKinds[m.cursor])
+			if tagExists(p.Tag) {
+				m.note = "tag " + p.Tag + " already exists"
 				return m, nil
 			}
+			if b := m.blockers(p); len(b) > 0 {
+				m.note = "can't release yet: " + b[0]
+				return m, nil
+			}
+			m.plan = p
 			m.stage = stConfirm
 		}
 	case stConfirm:
 		switch k {
 		case "y", "Y", "enter":
-			m.stage = stTagging
-			return m, m.tag()
+			if m.opts.DryRun {
+				m.stage = stDone
+				return m, tea.Quit
+			}
+			m.stage, m.step = stRunning, 0
+			return m, m.runStep()
 		case "n", "N", "esc", "backspace":
 			m.stage = stSelect
 		case "q":
 			return m, tea.Quit
 		}
-	case stWatching, stDone, stError:
+	case stWatching, stDone, stFailed, stError:
 		if k == "q" || k == "esc" || k == "enter" {
 			return m, tea.Quit
 		}
@@ -253,30 +333,13 @@ func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) tag() tea.Cmd {
-	tag, opts := m.newTag, m.opts
-	return func() tea.Msg {
-		if opts.DryRun {
-			return taggedMsg{}
-		}
-		if err := createTag(tag); err != nil {
-			return taggedMsg{fmt.Errorf("creating tag %s: %w", tag, err)}
-		}
-		if opts.NoPush {
-			return taggedMsg{}
-		}
-		if err := pushTag(opts.Remote, tag); err != nil {
-			// Leave nothing half-done: a local-only tag would make the
-			// next run think this version was already released.
-			deleteLocalTag(tag)
-			return taggedMsg{fmt.Errorf("pushing tag %s to %s: %w", tag, opts.Remote, err)}
-		}
-		return taggedMsg{}
-	}
+func (m model) runStep() tea.Cmd {
+	p, s := m.plan, m.plan.steps[m.step]
+	return func() tea.Msg { return stepMsg{s.Run(p)} }
 }
 
 func (m model) watch() tea.Cmd {
-	sha, tag := m.repo.Head, m.newTag
+	sha, tag := m.plan.Head, m.plan.Tag
 	return func() tea.Msg {
 		runs, err := runsForCommit(sha, tag)
 		rel, _ := loadRelease(tag)
@@ -295,6 +358,29 @@ func (m model) anyRunning() bool {
 	return summarise(m.tagRuns) == StateRunning || summarise(m.headRuns) == StateRunning
 }
 
+// blockers stop a release that would go wrong. Committing a version bump
+// needs a clean tree and a branch that can be pushed.
+func (m model) blockers(p *Plan) []string {
+	var b []string
+	if m.fileErr != "" {
+		b = append(b, m.fileErr)
+	}
+	if !p.bumping() {
+		return b
+	}
+	r := m.repo
+	if r.Dirty {
+		b = append(b, "uncommitted changes; commit or stash them, or run with --no-bump")
+	}
+	if r.Branch == "HEAD" {
+		b = append(b, "HEAD is detached, so there's no branch to commit the version bump to")
+	}
+	if r.Behind > 0 && p.Push {
+		b = append(b, fmt.Sprintf("%d commit(s) behind upstream; pull first", r.Behind))
+	}
+	return b
+}
+
 func (m model) warnings() []string {
 	var w []string
 	r := m.repo
@@ -308,19 +394,22 @@ func (m model) warnings() []string {
 		w = append(w, fmt.Sprintf("%d commit(s) behind upstream; pull first or you will tag old code", r.Behind))
 	}
 	if r.Ahead > 0 {
-		w = append(w, fmt.Sprintf("%d commit(s) not pushed; the tag will point at code the branch on %s doesn't have", r.Ahead, m.opts.Remote))
+		w = append(w, fmt.Sprintf("%d commit(s) not pushed yet", r.Ahead))
 	}
 	if !r.HasUpstream && r.Branch != "HEAD" {
 		w = append(w, "branch has no upstream")
 	}
 	if r.Dirty {
-		w = append(w, "uncommitted changes will not be part of the release")
+		w = append(w, "uncommitted changes")
 	}
 	if r.HasLatest && r.Unreleased == 0 {
 		w = append(w, "HEAD is already released as "+r.LatestTag)
 	}
 	if summarise(m.headRuns) == StateFail {
 		w = append(w, "checks on HEAD are failing")
+	}
+	if m.fileErr != "" {
+		w = append(w, m.fileErr)
 	}
 	return w
 }
@@ -408,6 +497,14 @@ func (m model) render() string {
 	case stError:
 		b.WriteString(" " + sRed.Render("✗ "+m.err.Error()) + "\n\n")
 		return b.String()
+	case stRunning, stWatching, stDone, stFailed:
+		if m.plan != nil && !(m.stage == stDone && m.opts.DryRun) {
+			m.renderSteps(&b)
+			if m.stage != stRunning {
+				m.renderResult(&b)
+			}
+			return b.String()
+		}
 	}
 
 	// Latest release
@@ -451,10 +548,32 @@ func (m model) render() string {
 	b.WriteString(line + "\n")
 	b.WriteString("   " + sDim.Render(short(m.repo.Head)+" "+truncate(m.repo.HeadSubject, 60)) + "\n")
 
+	// Version files
+	if !m.opts.NoBump {
+		b.WriteString("\n " + sHead.Render("Version files") + "\n")
+		width := 0
+		for _, f := range m.files {
+			width = max(width, len(f.Path))
+		}
+		if len(m.files) == 0 && m.cfg.Command == "" {
+			b.WriteString("   " + sDim.Render("none found; only the tag is created (list them in "+configName+")") + "\n")
+		}
+		for _, f := range m.files {
+			if f.Skip != "" {
+				fmt.Fprintf(&b, "   %s\n", sDim.Render(fmt.Sprintf("%-*s  %s  skipped: %s", width, f.Path, f.Current, f.Skip)))
+			} else {
+				fmt.Fprintf(&b, "   %-*s  %s\n", width, f.Path, f.Current)
+			}
+		}
+		if m.cfg.Command != "" {
+			b.WriteString("   " + sDim.Render("then runs: "+m.cfg.Command) + "\n")
+		}
+	}
+
 	if m.ghNote != "" {
 		b.WriteString("\n " + sDim.Render("ℹ "+m.ghNote) + "\n")
 	}
-	if w := m.warnings(); len(w) > 0 && m.stage <= stConfirm {
+	if w := m.warnings(); len(w) > 0 {
 		b.WriteString("\n")
 		for _, s := range w {
 			b.WriteString(" " + sYellow.Render("⚠ "+s) + "\n")
@@ -478,41 +597,71 @@ func (m model) render() string {
 				fmt.Fprintf(&b, "   %-6s  %s\n", k, arrow)
 			}
 		}
+		if m.note != "" {
+			b.WriteString("\n " + sRed.Render("✗ "+m.note) + "\n")
+		}
 		b.WriteString("\n " + sDim.Render("↑/↓ choose · enter select · r refresh · q quit") + "\n")
 
 	case stConfirm:
-		action := "Create tag %s on %s and push it to %s?"
-		if m.opts.NoPush {
-			action = "Create tag %s on %s (local only, not pushed to %s)?"
+		b.WriteString(" " + sHead.Render("Release "+m.plan.Tag+"?") + "\n")
+		for i, s := range m.plan.steps {
+			fmt.Fprintf(&b, "   %d. %s\n", i+1, s.Title)
 		}
-		b.WriteString(" " + fmt.Sprintf(action, sSel.Render(m.newTag), sBold.Render(short(m.repo.Head)), m.opts.Remote) + "\n")
-		b.WriteString("\n " + sDim.Render("y/enter confirm · n/esc back") + "\n")
+		b.WriteString("\n " + sDim.Render("y/enter go · n/esc back") + "\n")
 
-	case stTagging:
-		b.WriteString(" " + m.spin.View() + " Creating and pushing " + sBold.Render(m.newTag) + "…\n")
-
-	case stWatching, stDone:
-		m.renderResult(&b)
+	case stDone: // dry run
+		b.WriteString(" " + sYellow.Render("Dry run: nothing was changed. These steps would have run:") + "\n")
+		for i, s := range m.plan.steps {
+			fmt.Fprintf(&b, "   %d. %s\n", i+1, s.Title)
+		}
+		b.WriteString("\n")
 	}
 	return b.String()
 }
 
-func (m model) renderResult(b *strings.Builder) {
-	switch {
-	case m.opts.DryRun:
-		b.WriteString(" " + sYellow.Render("Dry run: would have created and pushed "+m.newTag) + "\n\n")
-		return
-	case m.opts.NoPush:
-		b.WriteString(" " + sGreen.Render("✓ Created "+m.newTag+" locally") + sDim.Render(fmt.Sprintf(" (push with: git push %s %s)", m.opts.Remote, m.newTag)) + "\n\n")
-		return
+func (m model) renderSteps(b *strings.Builder) {
+	b.WriteString(" " + sHead.Render("Releasing "+m.plan.Tag) + "\n")
+	for i, s := range m.plan.steps {
+		var mark string
+		switch {
+		case i < m.step:
+			mark = sGreen.Render("✓")
+		case i == m.step && m.stage == stRunning:
+			mark = m.spin.View()
+		case i == m.step && m.stage == stFailed:
+			mark = sRed.Render("✗")
+		default:
+			mark = sDim.Render("·")
+		}
+		fmt.Fprintf(b, "   %s %s\n", mark, s.Title)
 	}
-	b.WriteString(" " + sGreen.Render("✓ Pushed "+m.newTag) + "\n")
-	if m.gh == nil || m.opts.NoWatch {
+	b.WriteString("\n")
+}
+
+func (m model) renderResult(b *strings.Builder) {
+	if m.stage == stFailed {
+		b.WriteString(" " + sRed.Render("✗ "+m.err.Error()) + "\n")
+		if m.undo != "" {
+			b.WriteString("   " + sDim.Render(m.undo) + "\n")
+		}
 		b.WriteString("\n")
 		return
 	}
+	if m.opts.NoPush {
+		b.WriteString(" " + sGreen.Render("✓ Created "+m.plan.Tag+" locally") + "\n")
+		push := fmt.Sprintf("git push %s %s", m.opts.Remote, m.plan.Tag)
+		if m.plan.committed {
+			push = fmt.Sprintf("git push %s %s %s", m.opts.Remote, m.plan.Branch, m.plan.Tag)
+		}
+		b.WriteString("   " + sDim.Render("push with: "+push) + "\n\n")
+		return
+	}
+	if m.gh == nil || m.opts.NoWatch {
+		b.WriteString(" " + sGreen.Render("✓ Released "+m.plan.Tag) + "\n\n")
+		return
+	}
 
-	b.WriteString("\n " + sHead.Render("Release workflows") + "  ")
+	b.WriteString(" " + sHead.Render("Release workflows") + "  ")
 	if len(m.watchRuns) == 0 {
 		if m.stage == stDone {
 			b.WriteString(sDim.Render("none were triggered by the tag") + "\n")
@@ -528,7 +677,7 @@ func (m model) renderResult(b *strings.Builder) {
 	}
 	if m.newRelease != nil {
 		b.WriteString("\n    " + sDim.Render(m.newRelease.URL) + "\n")
-	} else if m.gh != nil {
+	} else {
 		b.WriteString("\n    " + sDim.Render(m.gh.URL+"/actions") + "\n")
 	}
 	if m.stage == stWatching {

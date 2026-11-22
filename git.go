@@ -95,18 +95,6 @@ func tagExists(tag string) bool {
 	return err == nil
 }
 
-func createTag(tag string) error {
-	_, err := git("tag", "-a", tag, "-m", "Release "+tag)
-	return err
-}
-
-func pushTag(remote, tag string) error {
-	_, err := git("push", remote, "refs/tags/"+tag)
-	return err
-}
-
-func deleteLocalTag(tag string) { _, _ = git("tag", "-d", tag) }
-
 func short(sha string) string {
 	if len(sha) > 7 {
 		return sha[:7]
