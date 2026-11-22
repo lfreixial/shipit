@@ -603,9 +603,6 @@ func (m model) render() string {
 		for _, f := range m.files {
 			width = max(width, len(f.Path))
 		}
-		if len(m.files) == 0 && m.cfg.Command == "" {
-			b.WriteString("   " + sDim.Render("none found; only the tag is created (list them in "+configName+")") + "\n")
-		}
 		for _, f := range m.files {
 			if f.Skip != "" {
 				fmt.Fprintf(&b, "   %s\n", sDim.Render(fmt.Sprintf("%-*s  %s  skipped: %s", width, f.Path, f.Current, f.Skip)))
@@ -615,6 +612,9 @@ func (m model) render() string {
 		}
 		if m.cfg.Command != "" {
 			b.WriteString("   " + sDim.Render("then runs: "+m.cfg.Command) + "\n")
+		}
+		if note := m.noFilesNote(); note != "" {
+			b.WriteString(m.wrap(sDim, "", note, 3))
 		}
 	}
 
