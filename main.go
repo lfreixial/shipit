@@ -77,6 +77,8 @@ run = "shipit"
 
 const globalTask = `#!/usr/bin/env bash
 #MISE description="Tag a new release (patch/minor/major) with shipit"
+# Global tasks run from mise's config root, so go back to where mise was run.
+cd "${MISE_ORIGINAL_CWD:-$PWD}" || exit 1
 exec shipit "$@"
 `
 
@@ -95,9 +97,14 @@ func initCmd(args []string) error {
 			dir = filepath.Join(home, ".config")
 		}
 		path := filepath.Join(dir, "mise", "tasks", "release")
-		if _, err := os.Stat(path); err == nil {
-			fmt.Println("already set up:", path)
-			return nil
+		if cur, err := os.ReadFile(path); err == nil {
+			if string(cur) == globalTask {
+				fmt.Println("already set up:", path)
+				return nil
+			}
+			if !strings.Contains(string(cur), "exec shipit") {
+				return fmt.Errorf("%s already exists and wasn't written by shipit; leaving it alone", path)
+			}
 		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
