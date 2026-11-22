@@ -53,7 +53,7 @@ If a step fails, shipit undoes what it can: it restores the files, removes an un
 
 Before tagging, shipit writes the new version into your version files and commits them, so the tag points at a commit that already carries its own version. It edits only the version string, so formatting, comments and key order stay exactly as they were.
 
-It looks for these tracked files at the repo root and one directory down (e.g. `src-tauri/`):
+It looks for these tracked files, at the repo root and one directory down (e.g. `src-tauri/`) unless noted:
 
 | File | What changes |
 | --- | --- |
@@ -62,6 +62,9 @@ It looks for these tracked files at the repo root and one directory down (e.g. `
 | `Cargo.toml` | `[package]` (or `[workspace.package]`) `version` |
 | `Cargo.lock` | the entry for each bumped crate |
 | `pyproject.toml` | `[project]` (or `[tool.poetry]`) `version` |
+| `lib/**/version.rb` | `VERSION = "…"` |
+| `*.gemspec` (repo root) | a literal `spec.version = "…"` (not `Mygem::VERSION`, which needs no edit) |
+| `Gemfile.lock` | your own gem's line under `PATH` / `remote: .` |
 | `VERSION` | the whole file |
 
 A detected file is bumped only if it currently holds the latest tag's version, so unrelated packages in a monorepo are left alone. The TUI lists each file it found, including any it skipped and why. With no version files, shipit only creates the tag.

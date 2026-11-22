@@ -68,15 +68,41 @@ var knownFiles = map[string]string{
 	"Cargo.toml":        "cargo",
 	"Cargo.lock":        "cargo-lock",
 	"pyproject.toml":    "pyproject",
+	"Gemfile.lock":      "gemfile-lock",
 	"VERSION":           "plain",
 }
 
+// Lock files record the project's own version too. They are bumped along
+// with the manifests next to (or below) them rather than detected on
+// their own.
+var lockKinds = map[string]bool{"cargo-lock": true, "gemfile-lock": true}
+
+// autoKind says whether auto-detection should consider a tracked file.
+func autoKind(p string) (string, bool) {
+	base, depth := path.Base(p), strings.Count(p, "/")
+	if k, ok := knownFiles[base]; ok && depth <= 1 {
+		return k, true
+	}
+	switch {
+	case base == "version.rb" && strings.HasPrefix(p, "lib/") && depth <= 4:
+		return "ruby-version", true // lib/mygem/version.rb, lib/my/gem/version.rb
+	case strings.HasSuffix(base, ".gemspec") && depth == 0:
+		return "gemspec", true
+	}
+	return "", false
+}
+
+// kindFor is how a file listed in .shipit.toml is edited.
 func kindFor(p string) (string, bool) {
 	base := path.Base(p)
 	if k, ok := knownFiles[base]; ok {
 		return k, true
 	}
 	switch {
+	case base == "version.rb":
+		return "ruby-version", true
+	case strings.HasSuffix(base, ".gemspec"):
+		return "gemspec", true
 	case strings.HasSuffix(base, ".json"):
 		return "json", true
 	case base == "version.txt" || strings.HasSuffix(base, "VERSION"):
@@ -103,7 +129,7 @@ func findVersionFiles(root string, cfg Config, latest Version, hasLatest bool) (
 			return nil, err
 		}
 		for _, p := range lines(out) {
-			if _, ok := knownFiles[path.Base(p)]; ok && strings.Count(p, "/") <= 1 {
+			if _, ok := autoKind(p); ok {
 				paths = append(paths, p)
 			}
 		}
@@ -123,7 +149,7 @@ func findVersionFiles(root string, cfg Config, latest Version, hasLatest bool) (
 			return nil, fmt.Errorf("%s: don't know how to bump %s", configName, p)
 		}
 		f := &VersionFile{Path: filepath.ToSlash(p), Kind: kind}
-		if kind == "cargo-lock" {
+		if lockKinds[kind] {
 			locks = append(locks, f)
 			continue
 		}
@@ -148,33 +174,46 @@ func findVersionFiles(root string, cfg Config, latest Version, hasLatest bool) (
 		files = append(files, f)
 	}
 
-	// A Cargo.lock follows the crates of the Cargo.toml files being bumped
-	// in its directory or below.
 	for _, l := range locks {
-		dir := path.Dir(l.Path)
 		data, err := os.ReadFile(filepath.Join(root, l.Path))
 		if err != nil {
 			continue
 		}
-		for _, f := range files {
-			if f.Kind != "cargo" || f.Skip != "" || !under(path.Dir(f.Path), dir) {
-				continue
-			}
-			toml, _ := os.ReadFile(filepath.Join(root, f.Path))
-			if _, _, name, ok := tomlString(toml, "package", "name"); ok {
+		if resolveLock(root, l, data, files) {
+			files = append(files, l)
+		} else if explicit {
+			return nil, fmt.Errorf("%s: %s has no entry for a bumped package", configName, l.Path)
+		}
+	}
+	return files, nil
+}
+
+// resolveLock works out which entries of a lock file belong to the
+// manifests being bumped, and reports whether there are any.
+func resolveLock(root string, l *VersionFile, data []byte, files []*VersionFile) bool {
+	dir := path.Dir(l.Path)
+	for _, f := range files {
+		if f.Skip != "" || !under(path.Dir(f.Path), dir) {
+			continue
+		}
+		switch {
+		case l.Kind == "cargo-lock" && f.Kind == "cargo":
+			// A Cargo.lock follows the crates of the Cargo.toml files below it.
+			manifest, _ := os.ReadFile(filepath.Join(root, f.Path))
+			if _, _, name, ok := tomlString(manifest, "package", "name"); ok {
 				if _, _, v, ok := lockEntry(data, name, f.Current); ok {
 					l.Crates = append(l.Crates, name)
 					l.Current = v
 				}
 			}
-		}
-		if len(l.Crates) > 0 {
-			files = append(files, l)
-		} else if explicit {
-			return nil, fmt.Errorf("%s: no bumped crate found in %s", configName, l.Path)
+		case l.Kind == "gemfile-lock" && (f.Kind == "ruby-version" || f.Kind == "gemspec"):
+			// A gem's own Gemfile.lock lists it under PATH (remote: .).
+			if spans := gemfileSpans(data, f.Current); len(spans) > 0 {
+				l.Current = f.Current
+			}
 		}
 	}
-	return files, nil
+	return l.Current != ""
 }
 
 func under(p, dir string) bool {
@@ -237,6 +276,24 @@ func versionSpans(kind string, data []byte, crates []string, current string) ([]
 			}
 		}
 		return spans, v, nil
+	case "ruby-version":
+		v, ok := add(regexString(data, rubyVersionRe))
+		if !ok {
+			return nil, "", errors.New("no VERSION = \"…\" constant")
+		}
+		return spans, v, nil
+	case "gemspec":
+		v, ok := add(regexString(data, gemspecVersionRe))
+		if !ok {
+			return nil, "", errors.New("no literal .version = \"…\"")
+		}
+		return spans, v, nil
+	case "gemfile-lock":
+		spans = gemfileSpans(data, current)
+		if len(spans) == 0 {
+			return nil, "", fmt.Errorf("no PATH gem at %s", current)
+		}
+		return spans, current, nil
 	case "plain":
 		s := bytes.TrimSpace(data)
 		if _, ok := parseTag(string(s)); !ok || bytes.ContainsAny(s, " \n") {
@@ -422,4 +479,50 @@ func lockEntry(data []byte, crate, want string) (int, int, string, bool) {
 		}
 	}
 	return 0, 0, "", false
+}
+
+// ---- Ruby and other source files ----
+
+var (
+	rubyVersionRe    = regexp.MustCompile(`(?m)^\s*VERSION\s*=\s*["']([^"'\n]+)["']`)
+	gemspecVersionRe = regexp.MustCompile(`(?m)^\s*\w+\.version\s*=\s*["']([^"'\n]+)["']`)
+	gemSpecLineRe    = regexp.MustCompile(`^    [A-Za-z0-9_.-]+ \(([^)\s]+)\)$`)
+)
+
+// regexString returns the span of the first capture group of re.
+func regexString(data []byte, re *regexp.Regexp) (int, int, string, bool) {
+	m := re.FindSubmatchIndex(data)
+	if m == nil {
+		return 0, 0, "", false
+	}
+	return m[2], m[3], string(data[m[2]:m[3]]), true
+}
+
+// gemfileSpans finds the versions of the gems a Gemfile.lock loads from
+// the repo itself:
+//
+//	PATH
+//	  remote: .
+//	  specs:
+//	    mygem (1.2.3)
+func gemfileSpans(data []byte, current string) []span {
+	var spans []span
+	inPath, local, off := false, false, 0
+	for _, l := range strings.SplitAfter(string(data), "\n") {
+		text := strings.TrimRight(l, "\r\n")
+		switch {
+		case text == "PATH":
+			inPath, local = true, false
+		case text == "" || !strings.HasPrefix(text, " "):
+			inPath = false
+		case inPath && strings.TrimSpace(text) == "remote: .":
+			local = true
+		case inPath && local:
+			if m := gemSpecLineRe.FindStringSubmatchIndex(text); m != nil && text[m[2]:m[3]] == current {
+				spans = append(spans, span{off + m[2], off + m[3]})
+			}
+		}
+		off += len(l)
+	}
+	return spans
 }
