@@ -49,10 +49,11 @@ type loadedMsg struct {
 	headRuns []Run
 	ghNote   string
 
-	root    string
-	cfg     Config
-	files   []*VersionFile
-	fileErr string
+	root     string
+	cfg      Config
+	files    []*VersionFile
+	fileErr  string
+	goModule string
 
 	err error
 }
@@ -83,11 +84,13 @@ type model struct {
 	headRuns []Run
 	ghNote   string
 
-	root    string
-	cfg     Config
-	files   []*VersionFile
-	fileErr string
+	root     string
+	cfg      Config
+	files    []*VersionFile
+	fileErr  string
+	goModule string // root go.mod's module path
 
+	width  int // terminal width, for wrapping long messages
 	cursor int
 	note   string // transient message on the select screen
 	plan   *Plan
@@ -123,6 +126,7 @@ func (m model) load() tea.Cmd {
 		if msg.cfg, err = loadConfig(msg.root); err != nil {
 			return loadedMsg{err: err}
 		}
+		msg.goModule = goModule(msg.root)
 		if !opts.NoBump {
 			msg.files, err = findVersionFiles(msg.root, msg.cfg, repo.Latest, repo.HasLatest)
 			if err != nil {
@@ -219,6 +223,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.repo, m.gh, m.release = msg.repo, msg.gh, msg.release
 		m.tagRuns, m.headRuns, m.ghNote = msg.tagRuns, msg.headRuns, msg.ghNote
 		m.root, m.cfg, m.files, m.fileErr = msg.root, msg.cfg, msg.files, msg.fileErr
+		m.goModule = msg.goModule
 		if m.stage == stLoading {
 			m.stage = stSelect
 		}
@@ -276,10 +281,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pollMsg:
 		return m, m.watch()
 
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		return m, nil
+
 	case tea.KeyPressMsg:
 		return m.key(msg)
 	}
 	return m, nil
+}
+
+// wrap renders a message line, wrapping it to the terminal so nothing is
+// cut off. Continuation lines are indented to line up with the text.
+func (m model) wrap(style lipgloss.Style, icon, text string, indent int) string {
+	pad := strings.Repeat(" ", indent)
+	if m.width <= indent+len(icon)+10 {
+		return pad + style.Render(icon+text) + "\n"
+	}
+	body := lipgloss.NewStyle().Width(m.width - indent - len([]rune(icon)) - 1).Render(text)
+	ls := strings.Split(body, "\n")
+	var b strings.Builder
+	for i, l := range ls {
+		lead := icon
+		if i > 0 {
+			lead = strings.Repeat(" ", len([]rune(icon)))
+		}
+		b.WriteString(pad + style.Render(lead+strings.TrimRight(l, " ")) + "\n")
+	}
+	return b.String()
 }
 
 func (m model) key(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -371,6 +400,11 @@ func (m model) blockers(p *Plan) []string {
 	var b []string
 	if m.fileErr != "" {
 		b = append(b, m.fileErr)
+	}
+	if next, ok := parseTag(p.Tag); ok {
+		if problem := goMajorProblem(m.goModule, next); problem != "" {
+			b = append(b, problem)
+		}
 	}
 	if !p.bumping() {
 		return b
@@ -585,12 +619,12 @@ func (m model) render() string {
 	}
 
 	if m.ghNote != "" {
-		b.WriteString("\n " + sDim.Render("ℹ "+m.ghNote) + "\n")
+		b.WriteString("\n" + m.wrap(sDim, "ℹ ", m.ghNote, 1))
 	}
 	if w := m.warnings(); len(w) > 0 {
 		b.WriteString("\n")
 		for _, s := range w {
-			b.WriteString(" " + sYellow.Render("⚠ "+s) + "\n")
+			b.WriteString(m.wrap(sYellow, "⚠ ", s, 1))
 		}
 	}
 	b.WriteString("\n")
@@ -605,6 +639,9 @@ func (m model) render() string {
 		b.WriteString(" " + sHead.Render("What kind of release?") + "\n")
 		for i, k := range bumpKinds {
 			arrow := sDim.Render(from+" → ") + sBold.Render(m.next(k).String())
+			if goMajorProblem(m.goModule, m.next(k)) != "" {
+				arrow += sYellow.Render("  ⚠ not valid for this Go module")
+			}
 			if i == m.cursor {
 				fmt.Fprintf(&b, " %s %s  %s\n", sSel.Render("❯"), sSel.Render(fmt.Sprintf("%-6s", k)), arrow)
 			} else {
@@ -612,7 +649,7 @@ func (m model) render() string {
 			}
 		}
 		if m.note != "" {
-			b.WriteString("\n " + sRed.Render("✗ "+m.note) + "\n")
+			b.WriteString("\n" + m.wrap(sRed, "✗ ", m.note, 1))
 		}
 		b.WriteString("\n " + sDim.Render("↑/↓ choose · enter select · r refresh · q quit") + "\n")
 
@@ -654,9 +691,9 @@ func (m model) renderSteps(b *strings.Builder) {
 
 func (m model) renderResult(b *strings.Builder) {
 	if m.stage == stFailed {
-		b.WriteString(" " + sRed.Render("✗ "+m.err.Error()) + "\n")
+		b.WriteString(m.wrap(sRed, "✗ ", m.err.Error(), 1))
 		if m.undo != "" {
-			b.WriteString("   " + sDim.Render(m.undo) + "\n")
+			b.WriteString(m.wrap(sDim, "", m.undo, 3))
 		}
 		b.WriteString("\n")
 		return
