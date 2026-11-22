@@ -181,3 +181,26 @@ func TestExplicitFiles(t *testing.T) {
 		t.Error("unknown file kinds must be rejected")
 	}
 }
+
+func TestTagWorkflows(t *testing.T) {
+	cases := map[string]bool{
+		"on: push\n":                                             true,
+		"on: [pull_request, push]\n":                             true,
+		"on:\n  push:\n":                                         true,
+		"on:\n  push:\n    branches: [main]\n":                   false,
+		"on:\n  push:\n    tags: ['v*']\n":                       true,
+		"on:\n  push:\n    branches: [main]\n    tags: ['v*']\n": true,
+		"on:\n  push:\n    paths: ['src/**']\n":                  true,
+		"on:\n  pull_request:\n  workflow_dispatch:\n":           false,
+	}
+	for body, want := range cases {
+		dir := repo(t, map[string]string{".github/workflows/x.yml": body})
+		got, known := tagWorkflows(dir)
+		if !known || got != want {
+			t.Errorf("%q: got %v (known %v), want %v", body, got, known, want)
+		}
+	}
+	if got, known := tagWorkflows(t.TempDir()); got || !known {
+		t.Error("no workflows means nothing runs on tags")
+	}
+}

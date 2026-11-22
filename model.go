@@ -98,6 +98,8 @@ type model struct {
 	watchRuns  []Run
 	newRelease *Release
 	watchErr   string
+	// no workflow in .github/workflows runs on tag pushes
+	noTagWorkflows bool
 }
 
 func newModel(opts Options) model {
@@ -243,6 +245,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.runStep()
 		}
 		if m.opts.NoPush || m.opts.NoWatch || m.gh == nil {
+			m.stage = stDone
+			return m, tea.Quit
+		}
+		if any, known := tagWorkflows(m.root); known && !any {
+			m.noTagWorkflows = true
 			m.stage = stDone
 			return m, tea.Quit
 		}
@@ -656,8 +663,12 @@ func (m model) renderResult(b *strings.Builder) {
 		b.WriteString("   " + sDim.Render("push with: "+push) + "\n\n")
 		return
 	}
-	if m.gh == nil || m.opts.NoWatch {
-		b.WriteString(" " + sGreen.Render("✓ Released "+m.plan.Tag) + "\n\n")
+	if m.gh == nil || m.opts.NoWatch || m.noTagWorkflows {
+		b.WriteString(" " + sGreen.Render("✓ Released "+m.plan.Tag) + "\n")
+		if m.noTagWorkflows {
+			b.WriteString("   " + sDim.Render("no workflow in .github/workflows runs on tag pushes, so there's nothing to watch") + "\n")
+		}
+		b.WriteString("\n")
 		return
 	}
 
