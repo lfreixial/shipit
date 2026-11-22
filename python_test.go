@@ -98,3 +98,18 @@ func TestNormalisePyName(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+func TestNeverDowngrade(t *testing.T) {
+	// main already carries the next major version (httpx-style): a patch
+	// release must not rewrite it backwards.
+	m := model{
+		repo:  RepoState{Latest: Version{Minor: 28, Patch: 1}, LatestTag: "0.28.1", HasLatest: true, Branch: "main"},
+		files: []*VersionFile{{Path: "httpx/__version__.py", Kind: "py-version", Current: "1.0.0"}},
+	}
+	if b := m.blockers(m.newPlan(Patch)); len(b) == 0 || !strings.Contains(b[0], "newer than 0.28.2") {
+		t.Fatalf("patch should be blocked, got %v", b)
+	}
+	if b := m.blockers(m.newPlan(Major)); len(b) != 0 {
+		t.Fatalf("major (1.0.0) should be allowed, got %v", b)
+	}
+}

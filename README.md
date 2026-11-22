@@ -62,12 +62,17 @@ It looks for these tracked files, at the repo root and one directory down (e.g. 
 | `Cargo.toml` | `[package]` (or `[workspace.package]`) `version` |
 | `Cargo.lock` | the entry for each bumped crate |
 | `pyproject.toml` | `[project]` (or `[tool.poetry]`) `version` |
+| `uv.lock` | your own project's entry |
+| `setup.cfg` / `setup.py` (repo root) | `[metadata] version` / a literal `version="…"` |
+| `__init__.py`, `__about__.py`, `__version__.py`, `_version.py`, `version.py` in `<pkg>/` or `src/<pkg>/` | `__version__ = "…"` |
 | `lib/**/version.rb` | `VERSION = "…"` |
 | `*.gemspec` (repo root) | a literal `spec.version = "…"` (not `Mygem::VERSION`, which needs no edit) |
 | `Gemfile.lock` | your own gem's line under `PATH` / `remote: .` |
 | `VERSION` | the whole file |
 
-A detected file is bumped only if it currently holds the latest tag's version, so unrelated packages in a monorepo are left alone. The TUI lists each file it found, including any it skipped and why. With no version files, shipit only creates the tag.
+Versions that are read from git tags (setuptools-scm, hatch-vcs, `dynamic = ["version"]` with no version file, Go modules) need no edits, so shipit only tags.
+
+A detected file is bumped only if it currently holds the latest tag's version, so unrelated packages in a monorepo are left alone. The TUI lists each file it found, including any it skipped and why. shipit never moves a file's version backwards: if `main` already says `1.0.0` while the last tag is `0.28.1`, a patch release is refused and you're asked for a bigger bump. With no version files, shipit only creates the tag.
 
 Bumping needs a clean working tree and an up-to-date branch. The commit is pushed straight to your current branch, so on a protected branch you need permission to push (admins can usually bypass the PR rule). Use `--no-bump` to only tag.
 
