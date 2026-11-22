@@ -70,6 +70,8 @@ It looks for these tracked files, at the repo root and one directory down (e.g. 
 | `Gemfile.lock` | your own gem's line under `PATH` / `remote: .` |
 | `VERSION` | the whole file |
 
+**Go:** a module's version is its tag, so there's nothing to bump. From v2 on, Go only accepts a `vN.x.y` tag from a module whose path ends in `/vN`, so shipit refuses (and marks in the menu) a major bump that `go.mod` isn't ready for. See [Go's major version guide](https://go.dev/doc/modules/major-version).
+
 Versions that are read from git tags (setuptools-scm, hatch-vcs, `dynamic = ["version"]` with no version file, Go modules) need no edits, so shipit only tags.
 
 A detected file is bumped only if it currently holds the latest tag's version, so unrelated packages in a monorepo are left alone. The TUI lists each file it found, including any it skipped and why. shipit never moves a file's version backwards: if `main` already says `1.0.0` while the last tag is `0.28.1`, a patch release is refused and you're asked for a bigger bump. With no version files, shipit only creates the tag.
