@@ -375,6 +375,13 @@ func (m model) blockers(p *Plan) []string {
 	if !p.bumping() {
 		return b
 	}
+	if next, ok := parseTag(p.Version); ok {
+		for _, f := range p.Files {
+			if cur, ok := parseTag(f.Current); ok && next.less(cur) {
+				b = append(b, fmt.Sprintf("%s is already %s, newer than %s; pick a bigger bump", f.Path, f.Current, p.Version))
+			}
+		}
+	}
 	r := m.repo
 	if r.Dirty {
 		b = append(b, "uncommitted changes; commit or stash them, or run with --no-bump")
