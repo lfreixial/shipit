@@ -69,13 +69,20 @@ var knownFiles = map[string]string{
 	"Cargo.lock":        "cargo-lock",
 	"pyproject.toml":    "pyproject",
 	"Gemfile.lock":      "gemfile-lock",
+	"uv.lock":           "uv-lock",
+	"setup.cfg":         "setup-cfg",
 	"VERSION":           "plain",
 }
 
 // Lock files record the project's own version too. They are bumped along
 // with the manifests next to (or below) them rather than detected on
 // their own.
-var lockKinds = map[string]bool{"cargo-lock": true, "gemfile-lock": true}
+var lockKinds = map[string]bool{"cargo-lock": true, "gemfile-lock": true, "uv-lock": true}
+
+// Python modules that conventionally hold __version__.
+var pyVersionFiles = map[string]bool{
+	"__init__.py": true, "__about__.py": true, "__version__.py": true, "_version.py": true, "version.py": true,
+}
 
 // autoKind says whether auto-detection should consider a tracked file.
 func autoKind(p string) (string, bool) {
@@ -88,6 +95,10 @@ func autoKind(p string) (string, bool) {
 		return "ruby-version", true // lib/mygem/version.rb, lib/my/gem/version.rb
 	case strings.HasSuffix(base, ".gemspec") && depth == 0:
 		return "gemspec", true
+	case base == "setup.py" && depth == 0:
+		return "setup-py", true
+	case pyVersionFiles[base] && (depth == 1 || (depth == 2 && strings.HasPrefix(p, "src/"))):
+		return "py-version", true // mypkg/__init__.py, src/mypkg/__about__.py
 	}
 	return "", false
 }
@@ -103,6 +114,10 @@ func kindFor(p string) (string, bool) {
 		return "ruby-version", true
 	case strings.HasSuffix(base, ".gemspec"):
 		return "gemspec", true
+	case base == "setup.py":
+		return "setup-py", true
+	case strings.HasSuffix(base, ".py"):
+		return "py-version", true
 	case strings.HasSuffix(base, ".json"):
 		return "json", true
 	case base == "version.txt" || strings.HasSuffix(base, "VERSION"):
@@ -206,6 +221,16 @@ func resolveLock(root string, l *VersionFile, data []byte, files []*VersionFile)
 					l.Current = v
 				}
 			}
+		case l.Kind == "uv-lock" && f.Kind == "pyproject":
+			// uv.lock lists the project itself under its normalised name.
+			manifest, _ := os.ReadFile(filepath.Join(root, f.Path))
+			if _, _, name, ok := tomlString(manifest, "project", "name"); ok {
+				name = normalisePyName(name)
+				if _, _, v, ok := lockEntry(data, name, f.Current); ok {
+					l.Crates = append(l.Crates, name)
+					l.Current = v
+				}
+			}
 		case l.Kind == "gemfile-lock" && (f.Kind == "ruby-version" || f.Kind == "gemspec"):
 			// A gem's own Gemfile.lock lists it under PATH (remote: .).
 			if spans := gemfileSpans(data, f.Current); len(spans) > 0 {
@@ -266,7 +291,25 @@ func versionSpans(kind string, data []byte, crates []string, current string) ([]
 			return nil, "", errors.New(`no version in [project] or [tool.poetry]`)
 		}
 		return spans, v, nil
-	case "cargo-lock":
+	case "py-version":
+		v, ok := add(regexString(data, pyVersionRe))
+		if !ok {
+			return nil, "", errors.New("no __version__ = \"…\"")
+		}
+		return spans, v, nil
+	case "setup-py":
+		v, ok := add(regexString(data, setupPyVersionRe))
+		if !ok {
+			return nil, "", errors.New("no literal version=\"…\"")
+		}
+		return spans, v, nil
+	case "setup-cfg":
+		v, ok := add(iniValue(data, "metadata", "version"))
+		if !ok {
+			return nil, "", errors.New("no version in [metadata]")
+		}
+		return spans, v, nil
+	case "cargo-lock", "uv-lock":
 		var v string
 		for _, c := range crates {
 			if cv, ok := add(lockEntry(data, c, current)); ok {
@@ -525,4 +568,33 @@ func gemfileSpans(data []byte, current string) []span {
 		off += len(l)
 	}
 	return spans
+}
+
+// ---- Python ----
+
+var (
+	pyVersionRe      = regexp.MustCompile(`(?m)^__version__\s*(?::\s*str\s*)?=\s*["']([^"'\n]+)["']`)
+	setupPyVersionRe = regexp.MustCompile(`\bversion\s*=\s*["']([0-9][^"'\n]*)["']`)
+	pyNameRe         = regexp.MustCompile(`[-_.]+`)
+)
+
+// normalisePyName is the PEP 503 form uv.lock uses for package names.
+func normalisePyName(name string) string {
+	return strings.ToLower(pyNameRe.ReplaceAllString(name, "-"))
+}
+
+// iniValue finds an unquoted `key = value` in an INI section (setup.cfg).
+// Values that aren't plain versions, like `attr: pkg.__version__`, don't
+// count.
+func iniValue(data []byte, section, key string) (int, int, string, bool) {
+	re := regexp.MustCompile(`^\s*` + regexp.QuoteMeta(key) + `\s*=\s*([0-9][^\s#;]*)\s*$`)
+	for _, l := range tomlLines(data) {
+		if l.table != section {
+			continue
+		}
+		if m := re.FindStringSubmatchIndex(l.text); m != nil {
+			return l.off + m[2], l.off + m[3], l.text[m[2]:m[3]], true
+		}
+	}
+	return 0, 0, "", false
 }
