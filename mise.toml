@@ -1,0 +1,18 @@
+[tools]
+go = "1.27"
+
+[tasks.build]
+description = "Build ./shipit"
+run = "go build -o shipit ."
+
+[tasks.test]
+description = "Run vet and tests"
+run = ["go vet ./...", "go test ./..."]
+
+[tasks.try]
+description = "Dry run against the current repository"
+run = "go run . --dry-run"
+
+[tasks.install]
+description = "Install shipit into GOBIN"
+run = "go install ."
